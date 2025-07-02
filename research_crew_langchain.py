@@ -1,104 +1,169 @@
 import os
 import requests
+import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
 from langchain.agents import initialize_agent, AgentType, Tool
 from langchain.memory import ConversationBufferMemory
 
+# -----------------------
 # Load environment variables
+# -----------------------
+
 load_dotenv()
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
+# -----------------------
 # Initialize Ollama
-llm = OllamaLLM(model="llama2", temperature=0.3)  
+# -----------------------
 
-# Enhanced Serper search function
-def serper_search(query):
-    url = "https://google.serper.dev/search"
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-    data = {"q": query, "num": 5}
+llm = OllamaLLM(model="llama2", temperature=0.3)
+
+# -----------------------
+# ArXiv Search Function
+# -----------------------
+
+def arxiv_search(user_query, max_results=5):
+    terms = [f'all:"{word}"' for word in user_query.strip().split()]
+    query_str = "+AND+".join(terms)
+
+    url = (
+        f"http://export.arxiv.org/api/query?"
+        f"search_query={query_str}&start=0&max_results={max_results}"
+    )
+    print(f"Requesting URL:\n{url}\n")
+
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=10)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
-        results = response.json()
-        if not results.get("organic"):
-            return "No results found"
-        output = []
-        for item in results["organic"][:5]:
-            title = item.get('title', 'No title')
-            snippet = item.get('snippet', 'No description')
-            link = item.get('link', '#')
-            output.append(f"• {title}\n  {snippet}\n  Source: {link}\n")
-        return "\n".join(output)
-    except Exception as e:
-        return f"Search failed: {str(e)}"
+        xml_data = response.text
 
-# Tool configuration
+        root = ET.fromstring(xml_data)
+
+        namespaces = {
+            "atom": "http://www.w3.org/2005/Atom",
+            "opensearch": "http://a9.com/-/spec/opensearch/1.1/",
+            "arxiv": "http://arxiv.org/schemas/atom"
+        }
+
+        total_elem = root.find("opensearch:totalResults", namespaces)
+        total_results = total_elem.text if total_elem is not None else "Unknown"
+        print(f"🔎 Total results found on arXiv: {total_results}")
+
+        entries = root.findall("atom:entry", namespaces)
+
+        if not entries:
+            return "No arXiv papers found."
+
+        results = []
+        for entry in entries:
+            title_elem = entry.find("atom:title", namespaces)
+            title_text = title_elem.text.strip() if title_elem is not None else "No Title"
+
+            summary_elem = entry.find("atom:summary", namespaces)
+            summary_text = summary_elem.text.strip() if summary_elem is not None else "No Summary"
+
+            link_elem = entry.find("atom:id", namespaces)
+            link = link_elem.text if link_elem is not None else "#"
+
+            authors = []
+            for author in entry.findall("atom:author", namespaces):
+                name_elem = author.find("atom:name", namespaces)
+                name = name_elem.text if name_elem is not None else "Unknown Author"
+                authors.append(name)
+            authors_str = ", ".join(authors) if authors else "No Authors Listed"
+
+            results.append(
+                f"• {title_text}\n"
+                f"  Authors: {authors_str}\n"
+                f"  Abstract: {summary_text[:300]}...\n"
+                f"  Link: {link}\n"
+            )
+
+        return "\n".join(results)
+
+    except requests.exceptions.RequestException as e:
+        return f"arXiv API request failed: {str(e)}"
+    except ET.ParseError as e:
+        return f"Failed to parse arXiv XML response: {str(e)}"
+    except Exception as e:
+        return f"An unexpected error occurred during arXiv search: {str(e)}"
+
+# -----------------------
+# Tool Configuration
+# -----------------------
+
 tools = [
     Tool(
-        name="SerperSearch",
-        func=serper_search,
-        description="Useful for searching the web about current topics. Input should be a clear search query."
+        name="ArxivSearch",
+        func=arxiv_search,
+        description="Search arXiv.org for academic papers. Input should be a research query."
     )
 ]
 
-# Memory setup
+# -----------------------
+# Memory Setup
+# -----------------------
+
 memory = ConversationBufferMemory(
     memory_key="chat_history",
     return_messages=True,
     output_key="output"
 )
 
-# Agent with strict formatting
+# -----------------------
+# Agent Configuration
+# -----------------------
+
 agent = initialize_agent(
     tools=tools,
     llm=llm,
-    agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
     verbose=True,
     memory=memory,
     handle_parsing_errors=True,
     max_iterations=3,
     agent_kwargs={
-        "prefix": """You are a research assistant that MUST use the SerperSearch tool when asked about current information.
-        Follow these rules STRICTLY:
-        1. ALWAYS use this format for tools:
-        Action:
-        ```
-        {{
-            "action": "SerperSearch",
-            "action_input": "your search query here"
-        }}
-        ```
-        2. Never make up answers - always use the tool
-        3. Keep queries concise but specific"""
+        "prefix": """
+If asked for academic papers, use the ArxivSearch tool with the search query.
+Never make up references.
+"""
     }
 )
 
-# Full workflow
+# -----------------------
+# Full Research Workflow
+# -----------------------
+
 if __name__ == "__main__":
-    topic = "recent developments in AI transforming education 2024"
+    topic = "physics learning education"
 
     try:
-        print("🔎 Phase 1: Researching...")
-        research = agent.run(
-            f"Use SerperSearch to find 5 concrete examples of {topic}. "
-            "For each result, include: (1) The development (2) How it's being used (3) Source URL"
-        )
-        print("\n📝 Research Results:\n", research)
+        # ✅ PHASE 1 - RUN TOOL DIRECTLY
+        print("\n🔎 Phase 1: Searching arXiv...\n")
+        research = arxiv_search(topic, max_results=5)
+        print("\n📚 Research Results:\n", research)
 
-        print("\n🔍 Phase 2: Verifying...")
-        verification = agent.run(
-            f"Verify these claims about {topic} by searching for supporting evidence:\n{research}"
+        # ✅ PHASE 2 - Verification via LLM
+        print("\n🔍 Phase 2: Verifying...\n")
+        verification_prompt = (
+            f"Check if these papers about {topic} are consistent and highlight discrepancies:\n\n{research}"
         )
+        verification = llm.invoke(verification_prompt)
         print("\n✅ Verification Results:\n", verification)
 
-        print("\n🧠 Phase 3: Summarizing...")
-        summary_prompt = f"Summarize the following research into a clear 3–5 paragraph article for students:\n{research}"
+        # ✅ PHASE 3 - Summarizing
+        print("\n🧠 Phase 3: Summarizing...\n")
+        summary_prompt = (
+            f"Summarize these findings into a 3-5 paragraph article for students:\n\n{research}"
+        )
         summary = llm.invoke(summary_prompt)
         print("\n📄 Summary:\n", summary)
 
-        print("\n🛡️ Phase 4: Fact-checking the summary...")
-        fact_check_prompt = f"Fact-check this summary. Correct any inaccuracies and cite supporting sources if possible:\n{summary}"
+        # ✅ PHASE 4 - Fact-checking
+        print("\n🛡️ Phase 4: Fact-checking the summary...\n")
+        fact_check_prompt = (
+            f"Fact-check this summary. Correct inaccuracies and cite arXiv sources if possible:\n\n{summary}"
+        )
         fact_check = llm.invoke(fact_check_prompt)
         print("\n✅ Final Fact-Checked Summary:\n", fact_check)
 
