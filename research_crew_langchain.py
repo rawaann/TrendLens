@@ -1,6 +1,7 @@
 import os
 import requests
 import xml.etree.ElementTree as ET
+import time
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
 from langchain.agents import initialize_agent, AgentType, Tool
@@ -16,10 +17,10 @@ load_dotenv()
 # Initialize Ollama
 # -----------------------
 
-llm = OllamaLLM(model="llama2", temperature=0.3)
+ollama_llm = OllamaLLM(model="llama2", temperature=0.3)
 
 # -----------------------
-# ArXiv Search Function
+# ArXiv Search Tool
 # -----------------------
 
 def arxiv_search(user_query, max_results=5):
@@ -33,7 +34,11 @@ def arxiv_search(user_query, max_results=5):
     print(f"Requesting URL:\n{url}\n")
 
     try:
+        start_time = time.time()
         response = requests.get(url, timeout=10)
+        duration = time.time() - start_time
+        print(f"⏱️ ArxivSearch API call took {duration:.2f} seconds")
+
         response.raise_for_status()
         xml_data = response.text
 
@@ -52,7 +57,7 @@ def arxiv_search(user_query, max_results=5):
         entries = root.findall("atom:entry", namespaces)
 
         if not entries:
-            return "No arXiv papers found."
+            return "Final Answer: No arXiv papers found."
 
         results = []
         for entry in entries:
@@ -79,7 +84,8 @@ def arxiv_search(user_query, max_results=5):
                 f"  Link: {link}\n"
             )
 
-        return "\n".join(results)
+        result_text = "\n".join(results)
+        return result_text
 
     except requests.exceptions.RequestException as e:
         return f"arXiv API request failed: {str(e)}"
@@ -92,80 +98,138 @@ def arxiv_search(user_query, max_results=5):
 # Tool Configuration
 # -----------------------
 
-tools = [
-    Tool(
-        name="ArxivSearch",
-        func=arxiv_search,
-        description="Search arXiv.org for academic papers. Input should be a research query."
-    )
-]
+arxiv_tool = Tool(
+    name="ArxivSearch",
+    func=arxiv_search,
+    description="Search arXiv.org for academic papers. Input should be a research query."
+)
 
 # -----------------------
-# Memory Setup
+# Retrieval Agent
 # -----------------------
 
-memory = ConversationBufferMemory(
+retrieval_memory = ConversationBufferMemory(
     memory_key="chat_history",
     return_messages=True,
     output_key="output"
 )
 
-# -----------------------
-# Agent Configuration
-# -----------------------
-
-agent = initialize_agent(
-    tools=tools,
-    llm=llm,
+retrieval_agent = initialize_agent(
+    tools=[arxiv_tool],
+    llm=ollama_llm,
     agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
     verbose=True,
-    memory=memory,
+    memory=retrieval_memory,
     handle_parsing_errors=True,
-    max_iterations=3,
+    max_iterations=1,
     agent_kwargs={
         "prefix": """
-If asked for academic papers, use the ArxivSearch tool with the search query.
-Never make up references.
+You are an academic research assistant whose only job is to run the ArxivSearch tool
+once to retrieve up to 5 academic papers matching the user's topic.
+- Do not summarize.
+- Do not analyze.
+- Do not invent any papers.
 """
     }
 )
 
 # -----------------------
-# Full Research Workflow
+# Summarization Agent
+# -----------------------
+
+summarization_memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    return_messages=True,
+    output_key="output"
+)
+
+summarization_agent = initialize_agent(
+    tools=[],
+    llm=ollama_llm,
+    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+    verbose=True,
+    memory=summarization_memory,
+    handle_parsing_errors=True,
+    max_iterations=1,
+    agent_kwargs={
+        "prefix": """
+You are an expert science writer. Your only task is:
+- Summarize the provided list of academic papers into a 3-5 paragraph article for students.
+- Do not invent new papers.
+- Do not cite extra references.
+- Do not perform fact-checking.
+"""
+    }
+)
+
+# -----------------------
+# Fact-Checking Agent
+# -----------------------
+
+factcheck_memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    return_messages=True,
+    output_key="output"
+)
+
+factcheck_agent = initialize_agent(
+    tools=[],
+    llm=ollama_llm,
+    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+    verbose=True,
+    memory=factcheck_memory,
+    handle_parsing_errors=True,
+    max_iterations=1,
+    agent_kwargs={
+        "prefix": """
+You are an academic fact-checker.
+- Your only job is to fact-check the provided summary.
+- Correct any inaccuracies you find.
+- Cite arXiv links where possible.
+- Do not summarize papers again.
+"""
+    }
+)
+
+# -----------------------
+# Full Pipeline Workflow
 # -----------------------
 
 if __name__ == "__main__":
     topic = "physics learning education"
 
     try:
-        # ✅ PHASE 1 - RUN TOOL DIRECTLY
-        print("\n🔎 Phase 1: Searching arXiv...\n")
-        research = arxiv_search(topic, max_results=5)
-        print("\n📚 Research Results:\n", research)
+        # STEP 1 — Retrieval
+        print("\n🔎 Phase 1 — Retrieval...\n")
 
-        # ✅ PHASE 2 - Verification via LLM
-        print("\n🔍 Phase 2: Verifying...\n")
-        verification_prompt = (
-            f"Check if these papers about {topic} are consistent and highlight discrepancies:\n\n{research}"
+        retrieval_prompt = (
+            f"Find up to 5 academic papers about {topic}. "
+            f"Use ArxivSearch only once. "
+            f"Return the list of papers as Final Answer."
         )
-        verification = llm.invoke(verification_prompt)
-        print("\n✅ Verification Results:\n", verification)
 
-        # ✅ PHASE 3 - Summarizing
-        print("\n🧠 Phase 3: Summarizing...\n")
-        summary_prompt = (
-            f"Summarize these findings into a 3-5 paragraph article for students:\n\n{research}"
-        )
-        summary = llm.invoke(summary_prompt)
-        print("\n📄 Summary:\n", summary)
+        retrieval_result = retrieval_agent.invoke({"input": retrieval_prompt}).get("output")
+        print("\n✅ Retrieved Papers:\n", retrieval_result)
 
-        # ✅ PHASE 4 - Fact-checking
-        print("\n🛡️ Phase 4: Fact-checking the summary...\n")
-        fact_check_prompt = (
-            f"Fact-check this summary. Correct inaccuracies and cite arXiv sources if possible:\n\n{summary}"
+        # STEP 2 — Summarization
+        print("\n📝 Phase 2 — Summarization...\n")
+
+        summarization_prompt = (
+            f"Summarize these papers into a 3-5 paragraph article for students:\n\n{retrieval_result}"
         )
-        fact_check = llm.invoke(fact_check_prompt)
-        print("\n✅ Final Fact-Checked Summary:\n", fact_check)
+
+        summary_result = summarization_agent.invoke({"input": summarization_prompt}).get("output")
+        print("\n✅ Summary:\n", summary_result)
+
+        # STEP 3 — Fact-Checking
+        print("\n🔍 Phase 3 — Fact-Checking...\n")
+
+        factcheck_prompt = (
+            f"Fact-check this summary. Correct any inaccuracies and cite arXiv links where possible:\n\n{summary_result}"
+        )
+
+        factcheck_result = factcheck_agent.invoke({"input": factcheck_prompt}).get("output")
+        print("\n✅ Fact-Checked Summary:\n", factcheck_result)
 
     except Exception as e:
         print(f"Error: {str(e)}")
