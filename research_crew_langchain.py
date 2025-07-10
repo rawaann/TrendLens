@@ -1,6 +1,8 @@
 import os
+import re
 import requests
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
 from langchain.agents import initialize_agent, AgentType, Tool
@@ -169,11 +171,13 @@ def process_paper_for_pdf(paper):
 # Tool Configuration
 # -----------------------
 
-arxiv_tool = Tool(
-    name="ArxivSearch",
-    func=arxiv_search,
-    description="Search arXiv.org for academic papers. Input should be a research query."
-)
+tools = [
+    Tool(
+        name="ArxivSearch",
+        func=arxiv_search,
+        description="Search arXiv.org for academic papers. Input should be a research query."
+    )
+]
 
 # -----------------------
 # Agent Classes for Better Communication
