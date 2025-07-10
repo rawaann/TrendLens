@@ -1,7 +1,11 @@
 import os
+import re
 import requests
 import xml.etree.ElementTree as ET
+import PyPDF2
+import io
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
 from langchain.agents import initialize_agent, AgentType, Tool
@@ -17,10 +21,10 @@ load_dotenv()
 # Initialize Ollama
 # -----------------------
 
-ollama_llm = OllamaLLM(model="llama2", temperature=0.3)
+llm = OllamaLLM(model="llama2", temperature=0.3)
 
 # -----------------------
-# ArXiv Search Tool
+# ArXiv Search Function
 # -----------------------
 
 def arxiv_search(user_query, max_results=5):
@@ -34,11 +38,7 @@ def arxiv_search(user_query, max_results=5):
     print(f"Requesting URL:\n{url}\n")
 
     try:
-        start_time = time.time()
         response = requests.get(url, timeout=10)
-        duration = time.time() - start_time
-        print(f"⏱️ ArxivSearch API call took {duration:.2f} seconds")
-
         response.raise_for_status()
         xml_data = response.text
 
@@ -57,7 +57,7 @@ def arxiv_search(user_query, max_results=5):
         entries = root.findall("atom:entry", namespaces)
 
         if not entries:
-            return "Final Answer: No arXiv papers found."
+            return "No arXiv papers found."
 
         results = []
         for entry in entries:
@@ -84,8 +84,7 @@ def arxiv_search(user_query, max_results=5):
                 f"  Link: {link}\n"
             )
 
-        result_text = "\n".join(results)
-        return result_text
+        return "\n".join(results)
 
     except requests.exceptions.RequestException as e:
         return f"arXiv API request failed: {str(e)}"
@@ -98,138 +97,174 @@ def arxiv_search(user_query, max_results=5):
 # Tool Configuration
 # -----------------------
 
-arxiv_tool = Tool(
-    name="ArxivSearch",
-    func=arxiv_search,
-    description="Search arXiv.org for academic papers. Input should be a research query."
-)
+tools = [
+    Tool(
+        name="ArxivSearch",
+        func=arxiv_search,
+        description="Search arXiv.org for academic papers. Input should be a research query."
+    )
+]
 
 # -----------------------
-# Retrieval Agent
+# Memory Setup
 # -----------------------
 
-retrieval_memory = ConversationBufferMemory(
+memory = ConversationBufferMemory(
     memory_key="chat_history",
     return_messages=True,
     output_key="output"
 )
 
-retrieval_agent = initialize_agent(
-    tools=[arxiv_tool],
-    llm=ollama_llm,
+# -----------------------
+# Agent Configuration
+# -----------------------
+
+agent = initialize_agent(
+    tools=tools,
+    llm=llm,
     agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
     verbose=True,
-    memory=retrieval_memory,
+    memory=memory,
     handle_parsing_errors=True,
-    max_iterations=1,
+    max_iterations=3,
     agent_kwargs={
         "prefix": """
-You are an academic research assistant whose only job is to run the ArxivSearch tool
-once to retrieve up to 5 academic papers matching the user's topic.
-- Do not summarize.
-- Do not analyze.
-- Do not invent any papers.
+If asked for academic papers, use the ArxivSearch tool with the search query.
+Never make up references.
 """
     }
 )
 
 # -----------------------
-# Summarization Agent
+# PDF Download/Extraction Helpers
 # -----------------------
 
-summarization_memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True,
-    output_key="output"
-)
+CACHE_DIR = "pdf_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-summarization_agent = initialize_agent(
-    tools=[],
-    llm=ollama_llm,
-    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
-    verbose=True,
-    memory=summarization_memory,
-    handle_parsing_errors=True,
-    max_iterations=1,
-    agent_kwargs={
-        "prefix": """
-You are an expert science writer. Your only task is:
-- Summarize the provided list of academic papers into a 3-5 paragraph article for students.
-- Do not invent new papers.
-- Do not cite extra references.
-- Do not perform fact-checking.
-"""
-    }
-)
+def extract_arxiv_id(link):
+    match = re.search(r'arxiv.org/(abs|pdf)/([\w.]+)', link)
+    return match.group(2) if match else None
 
-# -----------------------
-# Fact-Checking Agent
-# -----------------------
+def download_pdf(arxiv_id):
+    pdf_path = os.path.join(CACHE_DIR, f"{arxiv_id}.pdf")
+    if os.path.exists(pdf_path):
+        # Already cached
+        return pdf_path
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    response = requests.get(pdf_url)
+    if response.status_code == 200:
+        with open(pdf_path, "wb") as f:
+            f.write(response.content)
+        return pdf_path
+    else:
+        print(f"Failed to download PDF for {arxiv_id}")
+        return None
 
-factcheck_memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True,
-    output_key="output"
-)
-
-factcheck_agent = initialize_agent(
-    tools=[],
-    llm=ollama_llm,
-    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
-    verbose=True,
-    memory=factcheck_memory,
-    handle_parsing_errors=True,
-    max_iterations=1,
-    agent_kwargs={
-        "prefix": """
-You are an academic fact-checker.
-- Your only job is to fact-check the provided summary.
-- Correct any inaccuracies you find.
-- Cite arXiv links where possible.
-- Do not summarize papers again.
-"""
-    }
-)
-
-# -----------------------
-# Full Pipeline Workflow
-# -----------------------
-
-if __name__ == "__main__":
-    topic = "physics learning education"
-
+def extract_text_from_pdf(pdf_path):
     try:
-        # STEP 1 — Retrieval
-        print("\n🔎 Phase 1 — Retrieval...\n")
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() or ""
+        return text
+    except Exception as e:
+        print(f"PDF extraction error for {pdf_path}: {e}")
+        return ""
 
-        retrieval_prompt = (
-            f"Find up to 5 academic papers about {topic}. "
-            f"Use ArxivSearch only once. "
-            f"Return the list of papers as Final Answer."
+def process_paper(paper):
+    link = paper.get('link')
+    arxiv_id = extract_arxiv_id(link) if link else None
+    if not arxiv_id:
+        return paper['title'], link, ""
+    pdf_path = download_pdf(arxiv_id)
+    if not pdf_path:
+        return paper['title'], link, ""
+    text = extract_text_from_pdf(pdf_path)
+    return paper['title'], link, text
+
+# -----------------------
+# Full Research Workflow
+# -----------------------
+
+def run_research(topic):
+    start_time = time.time()
+    output = []
+    try:
+        # ✅ PHASE 1 - RUN TOOL DIRECTLY
+        output.append("\n🔎 Phase 1: Searching arXiv...\n")
+        retrieval_result = arxiv_search(topic, max_results=5)
+        output.append("\n📚 Research Results:\n" + retrieval_result)
+
+        # STEP 2 — Per-Paper Summarization (Full PDF)
+        output.append("\n📝 Phase 2 — Per-Paper Summarization (Full PDF)...\n")
+
+        # Parse papers from retrieval_result
+        papers = []
+        current = {}
+        for line in retrieval_result.splitlines():
+            if line.startswith('• '):
+                if current:
+                    papers.append(current)
+                current = {'title': line[2:].strip()}
+            elif line.strip().startswith('Abstract:'):
+                current['abstract'] = line.strip().split('Abstract:')[1].strip().rstrip('.')
+            elif line.strip().startswith('Link:'):
+                current['link'] = line.strip().split('Link:')[1].strip()
+        if current:
+            papers.append(current)
+
+        # Parallel PDF download/extraction
+        results = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(process_paper, paper) for paper in papers]
+            for future in as_completed(futures):
+                title, link, full_text = future.result()
+                results.append({'title': title, 'link': link, 'full_text': full_text})
+
+        # Summarize each paper using the full text
+        for paper in results:
+            title = paper.get('title', 'No Title')
+            link = paper.get('link', None)
+            full_text = paper.get('full_text', '')
+            if not full_text:
+                summary_input = f"Title: {title}\nLink: {link}\n(No PDF text available. Summarize using title only.)"
+            else:
+                summary_input = f"Title: {title}\nLink: {link}\nFull Text: {full_text[:8000]}"  # Truncate to avoid token limits
+            summarization_prompt = (
+                f"Summarize the following paper in detail, including technical aspects, for a student audience.\n{summary_input}"
+            )
+            summary_result = llm.invoke(summarization_prompt)
+            output.append(f"\n---\nSummary for: {title}\nPDF: {link}\n\n{summary_result}\n---\n")
+
+        # ✅ PHASE 3 - Fact-checking
+        output.append("\n🛡️ Phase 3: Fact-checking the summary...\n")
+        fact_check_prompt = (
+            f"Fact-check this summary. Correct inaccuracies and cite arXiv sources if possible:\n\n{summary_result}"
         )
+        fact_check = llm.invoke(fact_check_prompt)
+        output.append("\n✅ Final Fact-Checked Summary:\n" + str(fact_check))
 
-        retrieval_result = retrieval_agent.invoke({"input": retrieval_prompt}).get("output")
-        print("\n✅ Retrieved Papers:\n", retrieval_result)
-
-        # STEP 2 — Summarization
-        print("\n📝 Phase 2 — Summarization...\n")
-
-        summarization_prompt = (
-            f"Summarize these papers into a 3-5 paragraph article for students:\n\n{retrieval_result}"
+        # Trend Detection Step
+        output.append("\n📈 Phase 2b — Trend Detection in Topic...\n")
+        trend_input = ""
+        for paper in papers:
+            title = paper.get('title', 'No Title')
+            abstract = paper.get('abstract', '')
+            trend_input += f"Title: {title}\nAbstract: {abstract}\n\n"
+        trend_prompt = (
+            f"Analyze the following list of academic papers about {topic}. "
+            "Identify the most common research topics, emerging trends, and any notable shifts in focus. "
+            "Summarize your findings as a list of trends with brief explanations.\n\n"
+            f"{trend_input}"
         )
-
-        summary_result = summarization_agent.invoke({"input": summarization_prompt}).get("output")
-        print("\n✅ Summary:\n", summary_result)
-
-        # STEP 3 — Fact-Checking
-        print("\n🔍 Phase 3 — Fact-Checking...\n")
-
-        factcheck_prompt = (
-            f"Fact-check this summary. Correct any inaccuracies and cite arXiv links where possible:\n\n{summary_result}"
-        )
-
-        factcheck_result = factcheck_agent.invoke({"input": factcheck_prompt}).get("output")
-        print("\n✅ Fact-Checked Summary:\n", factcheck_result)
+        trend_result = llm.invoke(trend_prompt)
+        output.append("\n📈 Trend Detection Result:\n" + str(trend_result))
+        end_time = time.time()  # End timer
+        elapsed = end_time - start_time
+        output.append(f"\n⏱️ Total runtime: {elapsed:.2f} seconds")
 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        output.append(f"Error: {str(e)}")
+    return "\n".join(output)
