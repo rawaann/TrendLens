@@ -46,10 +46,6 @@ memory = ConversationBufferMemory(memory_key="chat_history", return_messages=Tru
 # Core Functions
 # -----------------------
 
-@lru_cache(maxsize=32)
-def cached_arxiv_search(user_query, max_results=ARXIV_MAX_RESULTS):
-    return arxiv_search(user_query, max_results)
-
 def arxiv_search(user_query, max_results=ARXIV_MAX_RESULTS):
     from lxml import etree  # Import etree at the top of the function for linter
     terms = [f'all:"{word}"' for word in user_query.strip().split()]
@@ -400,18 +396,6 @@ def detect_trends_tool(papers_text: str) -> str:
     except Exception as e:
         print(f"[TOOL] Error detecting trends: {e}")
         return f"Error detecting trends: {str(e)}"
-
-
-def summarize_multiple_papers_tool(papers_text: str) -> str:
-    global last_searched_papers
-    try:
-        context = get_last_searched_papers_context()
-        if not papers_text and last_searched_papers:
-            papers_text = "\n\n".join([p.get('full_text', '') for p in last_searched_papers if p.get('full_text')])
-        return f"Context:\n{context}\n\nTo summarize papers, please use the 'summarize_paper' tool with specific arXiv URLs.\n        \nExample: summarize_paper https://arxiv.org/abs/2208.00733v1\n        \nOr use the 'detect_trends' tool to analyze the papers you found."
-    except Exception as e:
-        return f"Error summarizing papers: {str(e)}"
-
 
 def analyze_trends_in_topic(topic: str) -> str:
     print(f"[TOOL] analyze_trends_in_topic called with topic: {topic}")
