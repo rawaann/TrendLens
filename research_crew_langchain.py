@@ -270,7 +270,7 @@ def search_papers_tool(topic: str) -> str:
         if abstract:
             result += f"   Abstract: {abstract[:400]}{'...' if len(abstract) > 400 else ''}\n"
         result += "\n"
-    return result
+    return f"Final Answer: Here are the papers I found for '{topic}':\n\n{result}"
 
 def get_last_searched_papers_context():
     """
@@ -331,34 +331,53 @@ def rag_tool(question: str) -> str:
     return f"Retrieved Context (from PDF chunks):\n{retrieved_context}\n\nAnswer: {answer}"
 
 
-def summarize_paper_tool(paper_url: str) -> str:
-    print(f"[TOOL] summarize_paper_tool called with URL: {paper_url}")
+def summarize_paper_tool(paper_ref: str) -> str:
+    print(f"[TOOL] summarize_paper_tool called with reference: {paper_ref}")
     global last_searched_papers
-    try:
-        arxiv_id = extract_arxiv_id(paper_url)
-        if not arxiv_id:
-            print("[TOOL] Invalid arXiv URL.")
-            return "Invalid arXiv URL. Please provide a valid arXiv link."
-        paper = {"link": paper_url, "title": f"Paper {arxiv_id}"}
-        print(f"[TOOL] Downloading and processing paper: {arxiv_id}")
-        processed_paper = process_paper_for_pdf(paper)
-        if processed_paper is None:
-            processed_paper = {}
-        if not processed_paper.get('full_text'):
-            print("[TOOL] Could not download or extract text from PDF.")
-            return "Could not download or extract text from the PDF."
-        print(f"[TOOL] Summarizing paper: {processed_paper.get('title', 'Unknown Title')}")
-        context = get_last_searched_papers_context()
+    arxiv_id = extract_arxiv_id(paper_ref)
+    matched_paper = None
+    # Try to match by arXiv ID from URL
+    if not arxiv_id:
+        # Try to match by index (e.g., 'first paper')
+        if paper_ref.lower().startswith("first") and last_searched_papers:
+            matched_paper = last_searched_papers[0]
+            arxiv_id = extract_arxiv_id(matched_paper.get('link', ''))
+        else:
+            # Try to match by title
+            for paper in last_searched_papers:
+                if paper_ref.lower() in paper.get('title', '').lower():
+                    matched_paper = paper
+                    arxiv_id = extract_arxiv_id(paper.get('link', ''))
+                    break
+    else:
+        # Try to find the paper in last_searched_papers by arXiv ID
+        for paper in last_searched_papers:
+            if arxiv_id in paper.get('link', ''):
+                matched_paper = paper
+                break
+    if not arxiv_id:
+        return "Invalid arXiv reference. Please provide a valid arXiv link or recognizable title."
+    # Use saved metadata and full text if available
+    if matched_paper and matched_paper.get('full_text'):
+        print(f"[TOOL] Using cached full text for summarization: {matched_paper.get('title', 'Unknown Title')}")
         summary = summarize_text_with_longt5(
-            processed_paper['full_text'], 
-            processed_paper.get('title', 'Unknown Title'),
-            paper_url
+            matched_paper['full_text'],
+            matched_paper.get('title', 'Unknown Title'),
+            matched_paper.get('link', '')
         )
-        last_searched_papers = [processed_paper]
-        return f"Context:\n{context}\n\nSummary of {processed_paper.get('title', 'Unknown Title')}:\n\n{summary}"
-    except Exception as e:
-        print(f"[TOOL] Error summarizing paper: {e}")
-        return f"Error summarizing paper: {str(e)}"
+        return f"Summary of {matched_paper.get('title', 'Unknown Title')} (arXiv: {arxiv_id}):\n\n{summary}"
+    # If not cached, process as before
+    paper_url = f"https://arxiv.org/abs/{arxiv_id}"
+    paper = {"link": paper_url, "title": f"Paper {arxiv_id}"}
+    processed_paper = process_paper_for_pdf(paper)
+    if not processed_paper.get('full_text'):
+        return "Could not download or extract text from the PDF."
+    summary = summarize_text_with_longt5(
+        processed_paper['full_text'],
+        processed_paper.get('title', 'Unknown Title'),
+        paper_url
+    )
+    return f"Summary of {processed_paper.get('title', 'Unknown Title')} (arXiv: {arxiv_id}):\n\n{summary}"
 
 
 def detect_trends_tool(papers_text: str) -> str:
@@ -471,12 +490,12 @@ all_tools = [
         name="search_papers",
         func=search_papers_tool,
         description=(
-            "Search arXiv for academic papers on a given topic and return a list of papers. "
-            "Use this tool when the user says things like: 'search', 'find papers', 'look up', 'get articles', 'show me papers about', 'list recent papers on', 'find research', or provides a research topic or keywords. "
-            "Input: A research topic, keywords, or a general subject area. "
-            "ONLY return the list of papers and STOP. "
-            "Do NOT summarize, analyze, or answer questions unless explicitly asked."
-        )
+            "Searches arXiv for academic papers on a given topic. "
+            "Input: A research topic, keywords, or subject area (e.g., 'quantum computing'). "
+            "Output: A formatted list of relevant papers, each with title, authors, link, and abstract. "
+            "Use ONLY for finding papers, not for summarizing or answering questions about content."
+        ),
+        return_direct=True
     ),
     Tool(
         name="rag",
@@ -538,21 +557,246 @@ all_tools = [
 unified_agent = initialize_agent(
     tools=all_tools,
     llm=llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,  # <--- Tool-only agent
+    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,  # <--- Tool-only agent
     verbose=False,
     handle_parsing_errors=True,
     memory=memory,
     system_message=(
-        "You are a research assistant with access to all tools: search, RAG, summarization, trend analysis, and verification. "
-        "For each user request, you MUST call the most appropriate tool and return ONLY the tool's output as the final answer. "
-        "NEVER answer from your own knowledge or memory for questions about paper content, summaries, or analysis—ALWAYS use the tools. "
-        "Do NOT output any thoughts, reasoning, or intermediate steps."
+        "You are a research assistant router. Your ONLY job is to determine which specialized agent "
+        "should handle each user request and route it appropriately. NEVER try to answer questions yourself. "
+        "Here are the agents you can route to:\n"
+        "1. search_agent: For finding papers on a topic (e.g., 'Find papers about X')\n"
+        "2. rag_agent: For answering questions about paper content (e.g., 'What does the paper say about Y?')\n"
+        "3. summary_agent: For summarizing specific papers (e.g., 'Summarize this paper: [link]')\n"
+        "4. trend_agent: For analyzing research trends (e.g., 'What are the trends in Z?')\n"
+        "5. verify_agent: For fact-checking claims against papers (e.g., 'Is this claim true?')\n"
+        "Carefully analyze the user's request and route to exactly one agent."
     )
 )
 
-# --- MAIN LOOP ---
+def create_search_agent():
+    """Agent specialized for searching arXiv"""
+    search_tools = [
+        Tool(
+            name="search_papers",
+            func=search_papers_tool,
+            description="Search arXiv for academic papers on a given topic. Returns a final answer.",
+            return_direct=True
+        )
+    ]
+    return initialize_agent(
+        tools=search_tools,
+        llm=llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,
+        handle_parsing_errors=False,
+        system_message=(
+            "Do NOT use inner thoughts or chain-of-thought reasoning. ONLY use your tool directly and return the result. "
+            "You are an academic search specialist. Your ONLY job is to search arXiv for papers "
+            "based on user queries. NEVER try to answer questions about content - just return search results. "
+            "Your responses should ONLY contain the list of papers from the search tool. "
+            "If the user asks for anything else, politely explain your limitation. "
+            "You MUST ONLY use the tools provided to you and NEVER answer from your own knowledge or without using a tool. "
+            "If you cannot answer using your tools, respond: 'I can only answer using my tools and cannot provide an answer otherwise.' "
+            "Example input: 'Find papers about quantum computing.'\n"
+            "Example output: '1. Title: ... Authors: ... Link: ... Abstract: ...'\n"
+            "When you have found and listed the relevant papers, respond with 'Final Answer:' followed by the list, and then stop. Do not continue searching or repeating actions."
+        )
+    )
+
+def create_rag_agent():
+    rag_tools = [
+        Tool(
+            name="rag",
+            func=rag_tool,
+            description="ONLY answer specific, direct questions about the content of the papers. NOT for summaries or overviews. Example input: 'What method does the first paper use?' Example output: [answer from rag tool]",
+            return_direct=True
+        )
+    ]
+    return initialize_agent(
+        tools=rag_tools,
+        llm=llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,
+        handle_parsing_errors=False,
+        system_message=(
+            "You are a research QA specialist. For every question, think step by step and use inner thoughts (chain-of-thought reasoning) before answering. NEVER use this tool for summarizing, overviews, or main points of a paper. ONLY use for direct Q&A about specific details. "
+            "Your ONLY job is to answer specific, direct questions about academic papers using their content through RAG. "
+            "NEVER use this tool for summaries, overviews, or general descriptions. ONLY use for direct Q&A. "
+            "You MUST ONLY use the tools provided to you and NEVER answer from your own knowledge or without using a tool. "
+            "If you cannot answer using your tools, respond: 'I can only answer using my tools and cannot provide an answer otherwise.' "
+            "Example input: 'What method does the first paper use?'\n"
+            "Example output: [answer from rag tool]"
+        )
+    )
+
+def create_summarization_agent():
+    summary_tools = [
+        Tool(
+            name="summarize_paper",
+            func=summarize_paper_tool,
+            description="ONLY provide comprehensive summaries or overviews of entire papers. NOT for answering specific questions. Example input: 'Summarize the first paper.' Example output: [summary from summarize_paper tool] Do NOT use or invent any other tool names.",
+            return_direct=True
+        )
+    ]
+    return initialize_agent(
+        tools=summary_tools,
+        llm=llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,
+        handle_parsing_errors=False,
+        system_message=(
+            "Do NOT use inner thoughts or chain-of-thought reasoning. ONLY use your tool directly and return the result. "
+            "NEVER use the RAG tool for summarization. ONLY use the summarize_paper tool for summaries, overviews, or main points. "
+            "You are a paper summarization specialist. Your ONLY job is to provide comprehensive summaries or overviews of entire academic papers. "
+            "If the user asks for a summary, overview, or main points of a paper, use ONLY the 'summarize_paper' tool. "
+            "NEVER use this tool for answering specific questions. ONLY use for full summaries or overviews. Do NOT use or invent any other tool names. "
+            "If the user asks for something outside this tool, respond: 'I can only summarize papers using the provided tool.' "
+            "You MUST ONLY use the tools provided to you and NEVER answer from your own knowledge or without using a tool. "
+            "If you cannot answer using your tools, respond: 'I can only answer using my tools and cannot provide an answer otherwise.' "
+            "Example input: 'Summarize the first paper.'\n"
+            "Example output: [summary from summarize_paper tool]"
+        )
+    )
+
+def create_trend_agent():
+    """Agent specialized for trend analysis"""
+    trend_tools = [
+        Tool(
+            name="detect_trends",
+            func=detect_trends_tool,
+            description="Analyze research trends in a set of papers using only this tool. Input: text or abstracts of papers. Output: structured trend analysis. Do NOT use or invent any other tool names.",
+            return_direct=True
+        ),
+        Tool(
+            name="analyze_trends_in_topic",
+            func=analyze_trends_in_topic,
+            description="Search for and analyze trends in a research topic using only this tool. Input: topic string. Output: structured trend analysis. Do NOT use or invent any other tool names.",
+            return_direct=True
+        )
+    ]
+    return initialize_agent(
+        tools=trend_tools,
+        llm=llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,
+        handle_parsing_errors=False,
+        system_message=(
+            "Do NOT use inner thoughts or chain-of-thought reasoning. ONLY use your tool directly and return the result. "
+            "You are a research trend analyst. You can ONLY use the 'detect_trends' and 'analyze_trends_in_topic' tools. "
+            "If the user asks for trend analysis, use ONLY these tools. Do NOT use or invent any other tool names. "
+            "If the user asks for something outside these tools, respond: 'I can only analyze trends using the provided tools.' "
+            "You MUST ONLY use the tools provided to you and NEVER answer from your own knowledge or without using a tool. "
+            "If you cannot answer using your tools, respond: 'I can only answer using my tools and cannot provide an answer otherwise.' "
+            "Example input: 'What are the trends in quantum computing?'\n"
+            "Example output: [structured trend analysis from detect_trends or analyze_trends_in_topic]"
+        )
+    )
+
+def create_verification_agent():
+    """Agent specialized for fact-checking"""
+    verify_tools = [
+        Tool(
+            name="verify_information",
+            func=verify_information_tool,
+            description="Verify claims against paper content",
+            return_direct=True
+        )
+    ]
+    return initialize_agent(
+        tools=verify_tools,
+        llm=llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,
+        handle_parsing_errors=False,
+        system_message=(
+            "Do NOT use inner thoughts or chain-of-thought reasoning. ONLY use your tool directly and return the result. "
+            "You are an academic fact-checker. Your ONLY job is to verify claims against paper content. "
+            "NEVER try to summarize, analyze trends, or answer general questions - just verify factual accuracy. "
+            "You MUST ONLY use the tools provided to you and NEVER answer from your own knowledge or without using a tool. "
+            "If you cannot answer using your tools, respond: 'I can only answer using my tools and cannot provide an answer otherwise.'"
+        )
+    )
+
+# -----------------------
+# Master Agent/Router
+# -----------------------
+
+def create_master_agent():
+    """Agent that routes to specialized sub-agents"""
+    # Initialize all sub-agents
+    search_agent = create_search_agent()
+    rag_agent = create_rag_agent()
+    summary_agent = create_summarization_agent()
+    trend_agent = create_trend_agent()
+    verify_agent = create_verification_agent()
+    
+    # Tools for the master agent
+    routing_tools = [
+        Tool(
+            name="search_agent",
+            func=lambda q, chat_history=None: search_agent.invoke({"input": q, "chat_history": chat_history or []})["output"],
+            description="Useful for searching arXiv for papers on a topic",
+            return_direct=True
+        ),
+        Tool(
+            name="rag_agent",
+            func=lambda q, chat_history=None: rag_agent.invoke({"input": q, "chat_history": chat_history or []})["output"],
+            description="Useful for answering questions about paper content",
+            return_direct=True
+        ),
+        Tool(
+            name="summary_agent",
+            func=lambda q, chat_history=None: summary_agent.invoke({"input": q, "chat_history": chat_history or []})["output"],
+            description="Useful for summarizing specific papers",
+            return_direct=True
+        ),
+        Tool(
+            name="trend_agent",
+            func=lambda q, chat_history=None: trend_agent.invoke({"input": q, "chat_history": chat_history or []})["output"],
+            description="Useful for analyzing research trends",
+            return_direct=True
+        ),
+        Tool(
+            name="verify_agent",
+            func=lambda q, chat_history=None: verify_agent.invoke({"input": q, "chat_history": chat_history or []})["output"],
+            description="Useful for verifying claims against paper content",
+            return_direct=True
+        )
+    ]
+    
+    return initialize_agent(
+        tools=routing_tools,
+        llm=llm,
+        agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+        verbose=True,  # <--- Set this to True
+        handle_parsing_errors=False,
+        memory=memory,
+        system_message=(
+            "Do NOT use inner thoughts or chain-of-thought reasoning. ONLY use your tool directly and return the result. "
+            "You are a research assistant router. Your ONLY job is to determine which specialized agent "
+            "should handle each user request and route it appropriately. NEVER try to answer questions yourself. "
+            "You MUST ONLY use the tools/agents provided to you and NEVER answer from your own knowledge or without using a tool. "
+            "If you cannot answer using your tools, respond: 'I can only answer using my tools and cannot provide an answer otherwise.' "
+            "If the user asks for a summary, overview, or main points, route to the summarization agent. If the user asks a specific question, route to the RAG agent. "
+            "Agents:\n"
+            "1. search_agent: For finding papers on a topic (e.g., 'Find papers about X')\n"
+            "2. rag_agent: For answering questions about paper content (e.g., 'What does the paper say about Y?')\n"
+            "3. summary_agent: For summarizing specific papers (e.g., 'Summarize this paper: [link]')\n"
+            "4. trend_agent: For analyzing research trends (e.g., 'What are the trends in Z?')\n"
+            "5. verify_agent: For fact-checking claims against papers (e.g., 'Is this claim true?')\n"
+            "Carefully analyze the user's request and route to exactly one agent."
+        )
+    )
+
+# -----------------------
+# Updated Main Function
+# -----------------------
+
 def main():
     print("🔬 Welcome! To search for papers, just type a topic. To ask a question about the papers, ask a follow-up after searching.")
+    master_agent = create_master_agent()
+    chat_history = []
     while True:
         user_query = input("\n💬 What would you like me to help you with? ").strip()
         if user_query.lower() in ['exit', 'quit', 'bye']:
@@ -560,6 +804,7 @@ def main():
             break
         if not user_query:
             continue
+            
         # Provide context about last searched papers
         if last_searched_papers:
             context = get_last_searched_papers_context()
@@ -567,10 +812,12 @@ def main():
         else:
             full_input = user_query
 
-        # Let the unified agent decide which tool to use
-        response = unified_agent.invoke({"input": full_input})
+        response = master_agent.invoke({
+            "input": full_input,
+            "chat_history": chat_history
+        })
         print(f"\n📝 Response:\n{response['output']}")
-
+        chat_history.append((user_query, response['output']))
 
 if __name__ == "__main__":
     main()
