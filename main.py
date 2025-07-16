@@ -18,5 +18,13 @@ def main():
         print(f"\n📝 Response:\n{response['output']}")
         chat_history.append((user_query, response['output']))
 
+def process_query(prompt, chat_history):
+       master_agent = create_master_agent()
+       response = master_agent.invoke({
+           "input": prompt,
+           "chat_history": chat_history
+       })
+       return response['output']
+
 if __name__ == "__main__":
     main() 
