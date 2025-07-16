@@ -1,0 +1,12 @@
+streamlit
+python-dotenv
+PyPDF2
+requests
+lxml
+langchain
+langchain_ollama
+sentence-transformers
+faiss-cpu
+transformers
+typing-extensions
+# ollama  # Uncomment if you use the Ollama Python package 
